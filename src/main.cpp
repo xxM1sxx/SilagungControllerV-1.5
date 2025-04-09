@@ -8,6 +8,8 @@
 #include <HardwareSerial.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -120,6 +122,13 @@ const unsigned long SCHEDULE_CHECK_INTERVAL = 5000; // Cek perubahan jadwal seti
 unsigned long lastScheduleDisplayTime = 0;
 const unsigned long SCHEDULE_DISPLAY_INTERVAL = 5000; // Tampilkan info jadwal setiap 5 detik
 
+// Tambahkan variabel global untuk NTP
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 25200); // GMT+7 untuk Indonesia (7*3600)
+bool rtcSynced = false; // Flag untuk mengetahui apakah RTC sudah disinkronkan
+unsigned long lastRtcSyncTime = 0;
+const unsigned long RTC_SYNC_INTERVAL = 86400000; // Sinkronisasi setiap 24 jam (1 hari)
+
 // Fungsi preTransmission dan postTransmission
 void preTransmission() {
   digitalWrite(RS485_DE, HIGH);
@@ -197,6 +206,7 @@ void isibak();
 void mixing();
 void supply();
 void relayoff();
+void syncRTC();
 
 // Fungsi untuk mengontrol relay individual
 void controlRelay(int relay, bool state) {
@@ -223,8 +233,6 @@ void setup(){
   pinMode(RELAY5, OUTPUT);
   pinMode(RELAY6, OUTPUT);
 
-  // Matikan semua relay pada awalnya
-
   // Inisialisasi I2C dengan pin yang ditentukan
   Wire.begin(SDA_PIN, SCL_PIN);
 
@@ -236,9 +244,18 @@ void setup(){
 
   // Cek apakah RTC kehilangan daya
   if (rtc.lostPower()) {
-    Serial.println("RTC lost power, setting default time!");
-    // Atur waktu default jika RTC kehilangan daya
-    rtc.adjust(DateTime(2025, 4, 8, 10, 11, 0));
+    Serial.println("RTC lost power, setting time from internet!");
+    // Coba sinkronisasi dengan waktu internet jika WiFi terhubung
+    if (WiFi.status() == WL_CONNECTED) {
+      syncRTC();
+    } else {
+      // Jika tidak bisa terhubung ke internet, pakai waktu default
+      rtc.adjust(DateTime(2023, 1, 1, 0, 0, 0));
+      Serial.println("Tidak bisa sinkronisasi waktu, menggunakan waktu default");
+    }
+  } else if (WiFi.status() == WL_CONNECTED) {
+    // Kalau RTC sudah ada power, tetap sinkronkan waktu saat boot untuk akurasi
+    syncRTC();
   }
 
   // Tampilkan waktu saat ini
@@ -499,6 +516,13 @@ void loop() {
     }
     
     lastScheduleCheckTime = millis();
+  }
+
+  // Di dalam loop(), sinkronisasi RTC setiap 24 jam jika terhubung internet
+  if (WiFi.status() == WL_CONNECTED && Firebase.ready() && 
+      (millis() - lastRtcSyncTime > RTC_SYNC_INTERVAL || !rtcSynced)) {
+    Serial.println("Waktunya sinkronisasi RTC (interval 24 jam)");
+    syncRTC();
   }
 
   delay(1000);
@@ -959,5 +983,57 @@ void printScheduleInfo() {
     Serial.print(" (");
     Serial.print(schedule.sequence[i].duration);
     Serial.println(" mnt)");
+  }
+}
+
+// Fungsi untuk sinkronisasi RTC dengan waktu internet
+void syncRTC() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n===== SINKRONISASI RTC DENGAN INTERNET =====");
+    
+    timeClient.begin();
+    timeClient.update();
+    
+    time_t epochTime = timeClient.getEpochTime();
+    struct tm *ptm = gmtime((time_t *)&epochTime);
+    
+    int tahun = ptm->tm_year + 1900;
+    int bulan = ptm->tm_mon + 1;
+    int tanggal = ptm->tm_mday;
+    int jam = timeClient.getHours();
+    int menit = timeClient.getMinutes();
+    int detik = timeClient.getSeconds();
+    
+    Serial.print("Waktu Internet: ");
+    Serial.print(tahun);
+    Serial.print("-");
+    if (bulan < 10) Serial.print("0");
+    Serial.print(bulan);
+    Serial.print("-");
+    if (tanggal < 10) Serial.print("0");
+    Serial.print(tanggal);
+    Serial.print(" ");
+    if (jam < 10) Serial.print("0");
+    Serial.print(jam);
+    Serial.print(":");
+    if (menit < 10) Serial.print("0");
+    Serial.print(menit);
+    Serial.print(":");
+    if (detik < 10) Serial.print("0");
+    Serial.println(detik);
+    
+    // Atur RTC dengan waktu dari internet
+    rtc.adjust(DateTime(tahun, bulan, tanggal, jam, menit, detik));
+    
+    DateTime now = rtc.now();
+    Serial.print("RTC berhasil diatur ke: ");
+    Serial.println(formatDateTime(now));
+    Serial.println("=========================================\n");
+    
+    rtcSynced = true;
+    timeClient.end();
+    lastRtcSyncTime = millis();
+  } else {
+    Serial.println("WiFi tidak terhubung, tidak dapat sinkronisasi RTC");
   }
 }
